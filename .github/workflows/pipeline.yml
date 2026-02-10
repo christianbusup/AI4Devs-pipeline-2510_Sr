@@ -166,20 +166,37 @@ jobs:
 
           # Install deps, Update Symlink, Restart Service
           ssh -o StrictHostKeyChecking=yes $EC2_USER@$EC2_HOST << EOF
+            set -e
+            echo "Starting deployment script..."
+            
+            # Load environment - crucial for non-interactive shells
+            export HOME="/home/$EC2_USER"
+            [ -s "\$HOME/.nvm/nvm.sh" ] && . "\$HOME/.nvm/nvm.sh" # Load nvm
+            [ -s "\$HOME/.profile" ] && . "\$HOME/.profile"       # Load profile
+            [ -s "\$HOME/.bash_profile" ] && . "\$HOME/.bash_profile" 
+            [ -s "\$HOME/.bashrc" ] && . "\$HOME/.bashrc" 
+
+            echo "Environment loaded. Checking npm..."
+            command -v npm || { echo "npm not found"; exit 1; }
+            npm --version
+
             cd $RELEASE_DIR
+            echo "Extracting artifact in $RELEASE_DIR..."
             tar -xzf $ARTIFACT_FILE
             rm $ARTIFACT_FILE
             
-            # Install dependencies
-            # Assuming npm is available on server
+            echo "Installing dependencies..."
             npm ci --production
             
-            # Switch symlink
+            echo "Updating symlink..."
             ln -sfn $RELEASE_DIR $APP_DIR/current
             
-            # Restart systemd service
-            # Sudo might be needed. Assuming EC2_USER has passwordless sudo for systemctl or permissions.
+            echo "Restarting specific service..."
+            # Try reloading systemd daemon first if needed
+            sudo systemctl daemon-reload || true
             sudo systemctl restart backend.service
+            
+            echo "Deployment SUCCESS."
           EOF
 
           echo "Deployment completed successfully."
