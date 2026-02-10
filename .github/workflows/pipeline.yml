@@ -1,0 +1,185 @@
+name: Monorepo Backend Pipeline
+
+on:
+  push:
+    branches-ignore:
+      - main # Assuming main is protected and we only want to trigger on feature branches as per "push to a branch... that has an open PR against main" logic implication, or maybe we allow main but the checks will handle it. The requirement says "Push to a branch (feature branch) that has an open PR".
+    # We can also filter paths here, but the user explicitly asked to use git diff in the workflow.
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  check-conditions:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check_all.outputs.should_run }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # Needed for git diff HEAD^ HEAD
+
+      - name: Check Open PR and Backend Changes
+        id: check_all
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Checking for open PR..."
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          echo "Current branch: $BRANCH_NAME"
+
+          # Check for Open PR
+          # Using gh api to check if there is an open PR from this branch
+          PR_COUNT=$(gh api -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/pulls?head=${{ github.repository_owner }}:$BRANCH_NAME&state=open" \
+            --jq 'length')
+
+          echo "Open PRs found: $PR_COUNT"
+
+          if [ "$PR_COUNT" -eq "0" ]; then
+            echo "No open PR found for branch $BRANCH_NAME. Skipping workflow."
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "PR found. Checking for backend changes..."
+
+          # Check for changes in /backend
+          # Handling the case where fetch-depth might be insufficient or new branch
+          # git diff --name-only HEAD^ HEAD
+
+          CHANGES=$(git diff --name-only HEAD^ HEAD -- backend/ || true)
+
+          if [ -z "$CHANGES" ]; then
+            echo "No changes detected in /backend. Skipping workflow."
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Changes detected in /backend:"
+          echo "$CHANGES"
+          echo "should_run=true" >> $GITHUB_OUTPUT
+
+  tests:
+    needs: check-conditions
+    if: needs.check-conditions.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install Dependencies and Test
+        working-directory: ./backend
+        run: |
+          # Command specified by requirements
+          TEST_CMD="npm ci && npm test"
+          eval "$TEST_CMD"
+
+  build:
+    needs: tests
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_name: backend-build-${{ github.sha }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Build Backend
+        working-directory: ./backend
+        run: |
+          # Command specified by requirements
+          BUILD_CMD="npm ci && npm run build"
+          eval "$BUILD_CMD"
+
+          # Prepare artifact (assuming build output is what we want, but requirement says "directory /backend (or result of build)")
+          # Since it's a generic node app, we might need the whole folder or dist. 
+          # Requirement: "Artifact final debe ser un .tar.gz... del directorio /backend (o del resultado de build)"
+          # We will tar the whole backend directory (excluding node_modules if we want small artifact, but npm ci needs package.json. 
+          # Usually for deployment we want node_modules or run install on server. Req 5 says "Descomprimir / instalar deps si aplica".
+          # So we will pack the sources or the build result. Let's pack the current state of backend/ after build.
+          # excluding node_modules to save space/time, install on server is safer for architecture diffs.
+
+      - name: Create Artifact
+        run: |
+          tar -czf backend-build-${{ github.sha }}.tar.gz -C backend .
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-build-${{ github.sha }}
+          path: backend-build-${{ github.sha }}.tar.gz
+          retention-days: 1
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-build-${{ github.sha }}
+
+      - name: Deploy to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          APP_DIR: ${{ secrets.APP_DIR }}
+          SHA: ${{ github.sha }}
+        run: |
+          echo "Setting up SSH..."
+          mkdir -p ~/.ssh
+          echo "$EC2_SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+          # Add host key to known_hosts to avoid interactive prompt, but verify StrictHostKeyChecking
+          # ssh-keyscan is one way, or strict checking=no (less secure but common in CI if host key rotates)
+          # Requirement: "StrictHostKeyChecking controlado"
+          ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
+
+          ARTIFACT_FILE="backend-build-${SHA}.tar.gz"
+          RELEASE_DIR="${APP_DIR}/releases/${SHA}"
+
+          echo "Deploying $ARTIFACT_FILE to $EC2_HOST..."
+
+          # Prepare release directory
+          ssh -o StrictHostKeyChecking=yes $EC2_USER@$EC2_HOST "mkdir -p $RELEASE_DIR"
+
+          # Copy artifact
+          scp -o StrictHostKeyChecking=yes $ARTIFACT_FILE $EC2_USER@$EC2_HOST:$RELEASE_DIR/
+
+          # Install deps, Update Symlink, Restart Service
+          ssh -o StrictHostKeyChecking=yes $EC2_USER@$EC2_HOST << EOF
+            cd $RELEASE_DIR
+            tar -xzf $ARTIFACT_FILE
+            rm $ARTIFACT_FILE
+            
+            # Install dependencies
+            # Assuming npm is available on server
+            npm ci --production
+            
+            # Switch symlink
+            ln -sfn $RELEASE_DIR $APP_DIR/current
+            
+            # Restart systemd service
+            # Sudo might be needed. Assuming EC2_USER has passwordless sudo for systemctl or permissions.
+            sudo systemctl restart backend.service
+          EOF
+
+          echo "Deployment completed successfully."
